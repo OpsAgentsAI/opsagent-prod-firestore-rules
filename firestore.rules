@@ -13,56 +13,144 @@ rules_version = '2';
 //
 // Apps + their collections:
 //
-//   lead-pipeline  →  leads/{*}, leads/{*}/shares/{*}, briefings/{*}, allowlist/{*}
-//   trainer        →  questions/{*}, users/{*}, (attempts/* writes via Admin SDK only)
+//   lead-pipeline  ->  leads/{*}, leads/{*}/shares/{*}, leads/{*}/notifications/{*},
+//                      documents/{*}, briefings/{*}, allowlist/{*}
+//   trainer        ->  questions/{*}, users/{*}, (attempts/* writes via Admin SDK only)
 //
 // History:
-//   - 2026-05-28: merged trainer's `questions/{*}` + `users/{*}` blocks into
-//     the lead-pipeline base ruleset. Previously the trainer's rules existed
-//     only in its repo and got silently overwritten on every lead-pipeline deploy.
+//   - 2026-05-28: merged trainer's `questions/{*}` + `users/{*}` blocks into the
+//     lead-pipeline base ruleset (postmortem: trainer rules were silently
+//     overwritten on every lead-pipeline deploy).
+//   - 2026-05-31: re-merged trainer blocks after they drifted out of the repo
+//     (card oChcWzCR / board-refinement). The repo's firestore.rules had lost
+//     questions/users/attempts; restoring them keeps the prod deploy a no-op
+//     superset so a lead-pipeline deploy can never stomp trainer again.
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── lead-pipeline helpers ──────────────────────────────────────────
+    // Allowlist enforced via custom claim `allowlisted: true` set by an
+    // onUserCreate auth trigger (see functions/index.js -> onUserCreate).
     function isAllowlistedUser() {
       return request.auth != null && request.auth.token.allowlisted == true;
     }
+
+    // Card 5Mqk5POS: admin role lets the user read every lead in the org.
+    // Set via custom claim by beforeCreate (see functions/index.js).
     function isAdmin() {
       return request.auth != null && request.auth.token.role == 'admin';
     }
+
+    // Lead is owned by the authenticated user (matches their email claim).
     function isOwner(data) {
       return request.auth != null && request.auth.token.email == data.ownerEmail;
     }
+
+    // Lead is shared with the authenticated user (their email is in sharedWith[]).
     function isShared(data) {
       return request.auth != null
         && data.sharedWith is list
         && data.sharedWith.hasAny([request.auth.token.email]);
     }
 
-    // ── lead-pipeline: leads ───────────────────────────────────────────
+    // Card zmqpEbRX: workspace / tenant partition. Backward-compatible:
+    //   - a stale JWT with no `workspace` claim resolves to 'personal'
+    //   - a legacy lead doc with no `workspace` field resolves to 'personal'
+    // so the personal CRM keeps working with zero migration. The OpsAgents
+    // workspace claim is stamped by beforeCreate + backfilled onto existing
+    // users by migrate/backfill-workspace.mjs (token refresh required for a
+    // stale-claim opsagents user to read their workspace via direct Firestore;
+    // the /api/leads layer applies the allowlist-map fallback in the meantime).
+    // NOTE: a custom claim that was never set is ABSENT from request.auth.token,
+    // and dot-access of an absent key ERRORS in rules ("Property X is undefined
+    // on object") — it does NOT yield null. Use the safe map accessor
+    // `.get(key, default)` so a stale-claim user (signed in before this shipped)
+    // resolves to 'personal' instead of erroring into PERMISSION_DENIED. Same for
+    // a legacy lead doc with no `workspace` field. (Caught by the emulator
+    // rules-test AC3 backward-compat case.)
+    function callerWorkspace() {
+      return request.auth != null ? request.auth.token.get('workspace', 'personal') : 'personal';
+    }
+    function leadWorkspace(data) {
+      return data.get('workspace', 'personal');
+    }
+    function sameWorkspace(data) {
+      return leadWorkspace(data) == callerWorkspace();
+    }
+
+    // ── B2Billing / msapps-invoicing: tenant-isolation helpers (card VrANOo4a) ──
+    // A signed-in user may touch ONLY the tenant whose id == their `tenantId`
+    // custom claim. Dot-access of an ABSENT claim THROWS in rules, so we read it
+    // via `.get('tenantId', '')`: a caller with no tenantId claim resolves to ''
+    // and is denied cleanly (never an error). The invoicing worker uses the
+    // Admin SDK (ADC) and bypasses these rules — they govern the browser SDK only.
+    function callerTenant() {
+      return request.auth != null ? request.auth.token.get('tenantId', '') : '';
+    }
+    function inTenant(tenantId) {
+      return callerTenant() != '' && callerTenant() == tenantId;
+    }
+
+    // Per-user lead documents — single Firestore, scoped by ownerEmail.
+    // Sharing: a lead can be `sharedWith: [email1, email2, ...]`. Anyone in
+    // that list (and on the allowlist) can read + update the lead. Only the
+    // owner can create, delete, or change ownerEmail/sharedWith.
     match /leads/{leadId} {
+      // Read: owner, shared user, or admin (Card 5Mqk5POS) — AND only within
+      // the caller's own workspace (Card zmqpEbRX: an admin never sees another
+      // tenant's leads).
       allow read:   if isAllowlistedUser()
-                    && (isOwner(resource.data) || isShared(resource.data) || isAdmin());
+                    && (isOwner(resource.data) || isShared(resource.data) || isAdmin())
+                    && sameWorkspace(resource.data);
+
+      // Create: must own it and the new doc's workspace must match the caller's
+      // (Card zmqpEbRX). Legacy clients that omit `workspace` create a
+      // 'personal' lead, which is correct for the personal CRM.
       allow create: if isAllowlistedUser()
                     && request.resource.data.ownerEmail == request.auth.token.email
-                    && request.resource.data.keys().hasAll(['name','stage','heat','date','ownerEmail']);
+                    && request.resource.data.keys().hasAll(['name','stage','heat','date','ownerEmail'])
+                    && leadWorkspace(request.resource.data) == callerWorkspace();
+
+      // Updates: shared users may change content (notes, stage, heat, etc.)
+      // but NOT ownerEmail, sharedWith, or workspace. Only the owner can change
+      // ownerEmail/sharedWith; nobody may move a lead across workspaces.
       allow update: if isAllowlistedUser()
                     && (isOwner(resource.data) || isShared(resource.data))
+                    && sameWorkspace(resource.data)
                     && request.resource.data.ownerEmail == resource.data.ownerEmail
+                    && leadWorkspace(request.resource.data) == leadWorkspace(resource.data)
                     && (
                          isOwner(resource.data)
                          || request.resource.data.sharedWith == resource.data.sharedWith
                        );
-      allow delete: if isAllowlistedUser() && isOwner(resource.data);
+
+      allow delete: if isAllowlistedUser() && isOwner(resource.data) && sameWorkspace(resource.data);
     }
 
-    // ── lead-pipeline: lead shares (admin-SDK only) ────────────────────
+    // Card QQOUvFy7 — share-link audit subcollection. Written by the
+    // /api/lead-shares Cloud Function via Admin SDK; clients should not
+    // touch it directly. Phase 2 (the public read-only route) will need
+    // to add a read rule keyed off the token+leadId pair.
     match /leads/{leadId}/shares/{shareId} {
       allow read, write: if false;
     }
 
-    // ── lead-pipeline: briefings ────────────────────────────────────────
+    // Card 6q9q8sJN — notification audit/debounce records. Written by the
+    // onLeadShared Cloud Function via Admin SDK (bypasses these rules);
+    // clients should not need direct access. Locked down to deny-by-default.
+    match /leads/{leadId}/notifications/{recipient} {
+      allow read, write: if false;
+    }
+
+    // Card ndyfy4tk + AyCxdsUk — proposal documents + drive-link tracking.
+    // Written by the /api/documents Cloud Function via Admin SDK (bypasses
+    // these rules); clients read via the same function. Lock down direct
+    // client access so the only path is through the authorized endpoint.
+    match /documents/{documentId} {
+      allow read, write: if false;
+    }
+
+    // Per-user briefings (history of daily AI briefings).
     match /briefings/{briefingId} {
       allow read:   if isAllowlistedUser() && isOwner(resource.data);
       allow create: if isAllowlistedUser()
@@ -70,10 +158,18 @@ service cloud.firestore {
       allow update, delete: if isAllowlistedUser() && isOwner(resource.data);
     }
 
-    // ── lead-pipeline: allowlist ───────────────────────────────────────
+    // Allowlist (read-only from clients; written by admin / firebase console).
     match /allowlist/{email} {
       allow read:  if request.auth != null && request.auth.token.email == email;
       allow write: if false;
+    }
+
+    // Card rxT1ep77 — dynamic teammate invites. Written ONLY by the admin-gated
+    // /api/invite Cloud Function (Admin SDK) and read ONLY by beforeCreate's
+    // getInvite (Admin SDK; bypasses rules). No client may touch it directly —
+    // explicit deny for defense-in-depth (also covered by the catch-all).
+    match /invites/{email} {
+      allow read, write: if false;
     }
 
     // ── trainer: question bank (R2) ────────────────────────────────────
@@ -94,7 +190,7 @@ service cloud.firestore {
                          && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
 
-    // ── trainer: attempts (Admin SDK only) ──────────────────────────────
+    // ── trainer: attempts (Admin SDK only) ─────────────────────────────
     // The `api` HTTPS function (Functions Gen 2) writes attempts on behalf
     // of authed clients (anon or not). Direct client writes are blocked
     // so a leaked anon ID token can't pollute the collection.
@@ -102,7 +198,18 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // ── catch-all deny ─────────────────────────────────────────────────
+    // ── B2Billing / msapps-invoicing: tenant tree (card VrANOo4a) ─────────
+    // tenants/{t} and everything beneath it (clients, drafts, inbound, audit)
+    // is readable/writable ONLY by a caller whose tenantId claim == {tenantId}.
+    // Additive to the union: no existing app uses tenants/** via the browser SDK.
+    match /tenants/{tenantId} {
+      allow read, write: if inTenant(tenantId);
+      match /{document=**} {
+        allow read, write: if inTenant(tenantId);
+      }
+    }
+
+    // Catch-all deny.
     match /{document=**} {
       allow read, write: if false;
     }
